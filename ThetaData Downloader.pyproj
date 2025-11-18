@@ -1,0 +1,75 @@
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" ToolsVersion="4.0">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>76b91002-0454-4263-ba0f-ace1e535f4b4</ProjectGuid>
+    <ProjectHome>.</ProjectHome>
+    <StartupFile>main.py</StartupFile>
+    <SearchPath>
+    </SearchPath>
+    <WorkingDirectory>.</WorkingDirectory>
+    <OutputPath>.</OutputPath>
+    <Name>ThetaData Downloader</Name>
+    <RootNamespace>ThetaData Downloader</RootNamespace>
+    <TestFramework>Pytest</TestFramework>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+    <DebugSymbols>true</DebugSymbols>
+    <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+    <DebugSymbols>true</DebugSymbols>
+    <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="config\settings.py" />
+    <Compile Include="config\__init__.py" />
+    <Compile Include="connectors\thetadata_api.py" />
+    <Compile Include="connectors\__init__.py" />
+    <Compile Include="downloaders\coordinator.py" />
+    <Compile Include="downloaders\symbol_loader.py" />
+    <Compile Include="downloaders\__init__.py" />
+    <Compile Include="main.py" />
+    <Compile Include="processors\data_parser.py" />
+    <Compile Include="processors\__init__.py" />
+    <Compile Include="python connectors\thetadata_mcp.py" />
+    <Compile Include="scripts\check_download_issue.py" />
+    <Compile Include="scripts\convert_combine.py" />
+    <Compile Include="scripts\fetch_abtc_history.py" />
+    <Compile Include="scripts\inspect_file.py" />
+    <Compile Include="scripts\investigate_mcp_response.py" />
+    <Compile Include="scripts\organize_trading_data.py" />
+    <Compile Include="scripts\testing_missing_bars.py" />
+    <Compile Include="scripts\test_consolidated_download.py" />
+    <Compile Include="scripts\validate_data_quality.py" />
+    <Compile Include="storage\parquet_writer.py" />
+    <Compile Include="storage\__init__.py" />
+    <Compile Include="utils\trading_calendar.py" />
+    <Compile Include="utils\diagnostics.py" />
+    <Compile Include="utils\helpers.py" />
+    <Compile Include="utils\logger.py" />
+    <Compile Include="utils\__init__.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="config\" />
+    <Folder Include="connectors\" />
+    <Folder Include="downloaders\" />
+    <Folder Include="processors\" />
+    <Folder Include="python connectors\" />
+    <Folder Include="scripts\" />
+    <Folder Include="storage\" />
+    <Folder Include="utils\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="connectors\thet" />
+  </ItemGroup>
+  <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
+  <!-- Uncomment the CoreCompile target to enable the Build command in
+       Visual Studio and specify your pre- and post-build commands in
+       the BeforeBuild and AfterBuild targets below. -->
+  <!--<Target Name="CoreCompile" />-->
+  <Target Name="BeforeBuild">
+  </Target>
+  <Target Name="AfterBuild">
+  </Target>
+</Project>
