@@ -405,10 +405,16 @@ class ThetaDataMCP:
                     raise
 
                 error_type = type(e).__name__
-                
+                error_message = str(e)
+
                 # Check if it's a connection error that should trigger retry
-                connection_errors = ['ClosedResourceError', 'McpError', 'ConnectionError', 'BrokenPipeError', 'ReadTimeout']
-                is_connection_error = any(err in error_type or err in str(e) for err in connection_errors)
+                # Includes transient errors mapped from internal cancel-scope timeouts
+                connection_errors = ['ClosedResourceError', 'McpError', 'ConnectionError', 'BrokenPipeError', 'ReadTimeout', 'RuntimeError']
+                is_connection_error = any(err in error_type or err in error_message for err in connection_errors)
+
+                # Specifically handle mapped cancel-scope timeouts as connection errors
+                if 'ReadTimeout' in error_message and 'cancel-scope' in error_message:
+                    is_connection_error = True
                 
                 if is_connection_error:
                     self.logger.warning(f"[{symbol}] Connection error: {error_type} (attempt {attempt + 1}/{max_retries})")

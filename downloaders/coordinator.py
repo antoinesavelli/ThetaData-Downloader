@@ -327,21 +327,16 @@ class DownloadCoordinator:
                         should_skip, _ = self.parser.null_tracker.should_skip_symbol(symbol, date)
                         if should_skip:
                             return (symbol, None)
-                
-                    # ✅ Use timeout context manager instead of wait_for
-                    # This provides cleaner cancellation semantics
-                    try:
-                        async with asyncio.timeout(self.config.REQUEST_TIMEOUT):
-                            raw_data = await self.api.fetch_market_data(
-                                symbol,
-                                date,
-                                start_time=self.config.START_TIME,
-                                end_time=self.config.END_TIME
-                            )
-                    except asyncio.TimeoutError:
-                        # Timeout from our timeout context
-                        self.logger.debug(f"[{symbol}] [{date}] Request timeout")
-                        return (symbol, None)
+
+                    # ✅ FIXED: Remove coordinator-level timeout to allow MCP client's retry logic to work
+                    # The MCP client has its own timeout (60s) and retry logic (3 attempts with exponential backoff)
+                    # Adding a timeout here causes premature cancellation and prevents retries
+                    raw_data = await self.api.fetch_market_data(
+                        symbol,
+                        date,
+                        start_time=self.config.START_TIME,
+                        end_time=self.config.END_TIME
+                    )
                 
                     # Quick empty check
                     if not raw_data:

@@ -51,7 +51,9 @@ class Config:
         # Each file contains ALL symbols for that day
         
         # Request Configuration
-        self.REQUEST_TIMEOUT = 60
+        # ✅ FIXED: Increased timeout to 120s to handle slower API responses
+        # With 3 retries, this gives up to 360s (6 minutes) total per symbol
+        self.REQUEST_TIMEOUT = 120
         self.MAX_CONCURRENT_REQUESTS = 50  # Download 50 symbols concurrently per day
         self.RATE_LIMIT_DELAY = 0.0  # ✅ No delay between requests (API handles rate limiting)
         
