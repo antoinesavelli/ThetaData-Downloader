@@ -108,8 +108,14 @@ class ThetaDataMCP:
                     return False
                 
                 async with asyncio.timeout(self._request_timeout):
-                    # Create SSE client connection
-                    self._sse_context = sse_client(self.mcp_url)
+                    # Create SSE client connection with extended timeouts
+                    # Default sse_client timeouts are too short (5s request, 300s read)
+                    # When Theta Terminal queue backs up, reads take longer
+                    self._sse_context = sse_client(
+                        self.mcp_url,
+                        timeout=self._request_timeout,  # HTTP request timeout (default was 5s)
+                        sse_read_timeout=self._request_timeout * 3  # SSE read timeout (default was 300s)
+                    )
                     reader, writer = await self._sse_context.__aenter__()
                     self.logger.debug("SSE client connection established")
                     
