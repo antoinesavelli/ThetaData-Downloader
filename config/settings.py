@@ -54,8 +54,12 @@ class Config:
         # ✅ FIXED: Increased timeout to 120s to handle slower API responses
         # With 3 retries, this gives up to 360s (6 minutes) total per symbol
         self.REQUEST_TIMEOUT = 120
-        self.MAX_CONCURRENT_REQUESTS = 50  # Download 50 symbols concurrently per day
-        self.RATE_LIMIT_DELAY = 0.0  # ✅ No delay between requests (API handles rate limiting)
+
+        # ✅ FIXED: ThetaData Terminal has HTTP_CONCURRENCY limit (default=4, max=24)
+        # Sending more concurrent requests than this causes timeouts as requests queue up
+        # See: https://http-docs.thetadata.us/Articles/Performance-And-Tuning/Concurrent-Requests.html
+        self.MAX_CONCURRENT_REQUESTS = 20  # Stay under Theta Terminal's limit (default=4, max=24)
+        self.RATE_LIMIT_DELAY = 0.1  # Small delay between requests to prevent queue buildup
         
         # Parquet Configuration
         self.PARQUET_COMPRESSION = "snappy"  # Fast compression

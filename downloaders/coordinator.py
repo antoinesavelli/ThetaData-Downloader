@@ -311,13 +311,16 @@ class DownloadCoordinator:
     
         return all_raw_data
 
-    async def _download_chunk(self, symbols: List[str], date: str, 
+    async def _download_chunk(self, symbols: List[str], date: str,
                              chunk_idx: int, total_chunks: int) -> Dict[str, Any]:
         """
         Download a single chunk of symbols with proper error isolation.
         """
-        semaphore = asyncio.Semaphore(len(symbols))  # Allow all in this chunk concurrently
-    
+        # ✅ FIXED: Use configured concurrency limit, not chunk size
+        # This prevents overwhelming Theta Terminal's HTTP_CONCURRENCY limit
+        semaphore = asyncio.Semaphore(self.config.MAX_CONCURRENT_REQUESTS)
+        rate_limit_delay = getattr(self.config, 'RATE_LIMIT_DELAY', 0.0)
+
         async def download_raw_safe(symbol: str) -> tuple[str, Optional[Any]]:
             """Download with individual timeout and error handling."""
             async with semaphore:
@@ -329,7 +332,7 @@ class DownloadCoordinator:
                             return (symbol, None)
 
                     # ✅ FIXED: Remove coordinator-level timeout to allow MCP client's retry logic to work
-                    # The MCP client has its own timeout (60s) and retry logic (3 attempts with exponential backoff)
+                    # The MCP client has its own timeout (120s) and retry logic (3 attempts with exponential backoff)
                     # Adding a timeout here causes premature cancellation and prevents retries
                     raw_data = await self.api.fetch_market_data(
                         symbol,
@@ -337,6 +340,10 @@ class DownloadCoordinator:
                         start_time=self.config.START_TIME,
                         end_time=self.config.END_TIME
                     )
+
+                    # ✅ Small delay between requests to prevent queue buildup on Theta Terminal
+                    if rate_limit_delay > 0:
+                        await asyncio.sleep(rate_limit_delay)
                 
                     # Quick empty check
                     if not raw_data:
