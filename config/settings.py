@@ -58,8 +58,11 @@ class Config:
         # ✅ FIXED: ThetaData Terminal has HTTP_CONCURRENCY limit (default=4, max=24)
         # Sending more concurrent requests than this causes timeouts as requests queue up
         # See: https://http-docs.thetadata.us/Articles/Performance-And-Tuning/Concurrent-Requests.html
-        self.MAX_CONCURRENT_REQUESTS = 20  # Stay under Theta Terminal's limit (default=4, max=24)
+        self.MAX_CONCURRENT_REQUESTS = 10  # Reduced from 20 to test if SSE connection is bottleneck
         self.RATE_LIMIT_DELAY = 0.1  # Small delay between requests to prevent queue buildup
+
+        # ✅ DIAGNOSTIC: Refresh MCP connection before each day to test if staleness causes slowdowns
+        self.REFRESH_CONNECTION_PER_DAY = True  # Set to False after testing
         
         # Parquet Configuration
         self.PARQUET_COMPRESSION = "snappy"  # Fast compression

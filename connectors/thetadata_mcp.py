@@ -307,9 +307,12 @@ class ThetaDataMCP:
         return False
 
     async def fetch_market_data(self, symbol: str, date: str, start_time: str = None, end_time: str = None, max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetch market data using MCP protocol with retry logic and error rate limiting.""" 
-        
+        """Fetch market data using MCP protocol with retry logic and error rate limiting."""
+
+        import time
+
         for attempt in range(max_retries):
+            request_start = time.time()
             try:
                 # Check if session is valid, reconnect if needed
                 if not self._session or (hasattr(self._session, 'closed') and self._session.closed):
@@ -334,13 +337,16 @@ class ThetaDataMCP:
                 args = self._build_request_args(symbol, date, start_time, end_time)
                 if not args:
                     return None
-                
+
+                call_tool_start = time.time()
                 self.logger.debug(f"[{symbol}] Requesting data (attempt {attempt + 1}/{max_retries}) with args: {args}")
-                
+
                 # Add timeout to tool call - handle anyio/httpx cancellations explicitly
                 try:
                     async with asyncio.timeout(self._request_timeout):
                         response = await self._session.call_tool(self._tool_name, arguments=args)
+                        call_tool_duration = time.time() - call_tool_start
+                        self.logger.debug(f"[{symbol}] call_tool() took {call_tool_duration:.2f}s")
                 except asyncio.CancelledError as ce:
                     # Distinguish between:
                     #  - explicit task cancellation triggered by coordinator/user (propagate)
@@ -367,11 +373,15 @@ class ThetaDataMCP:
                     raise
 
                 self.logger.debug(f"[{symbol}] Raw response type: {type(response)}")
-                
+
+                parse_start = time.time()
                 result = await self._handle_rpc_response(response, symbol)
-                
+                parse_duration = time.time() - parse_start
+
                 # If successful, return result
                 if result is not None:
+                    total_duration = time.time() - request_start
+                    self.logger.info(f"[{symbol}] ✓ Request completed in {total_duration:.2f}s (call_tool: {call_tool_duration:.2f}s, parse: {parse_duration:.2f}s)")
                     # ✅ Reset error count on success
                     await self._reset_error_count()
                     return result

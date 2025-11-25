@@ -121,15 +121,29 @@ class DownloadCoordinator:
             self.logger.error(f"Download error: {e}")
             return self._build_error_summary(symbols, str(e))
 
-    async def _download_and_parse_day(self, date: str, symbols: List[str], 
+    async def _download_and_parse_day(self, date: str, symbols: List[str],
                                       output_dir: str) -> Dict:
         """
         OPTIMIZED: Download all raw data, then batch parse and write.
         """
+        # ✅ DIAGNOSTIC: Check if we should refresh connection before each day
+        # This tests if connection staleness is causing slowdowns
+        if hasattr(self.api, 'mcp_client') and self.api.mcp_client:
+            connection_refresh = getattr(self.config, 'REFRESH_CONNECTION_PER_DAY', False)
+            if connection_refresh:
+                self.logger.info(f"[{date}] Refreshing MCP connection before day")
+                try:
+                    await self.api.mcp_client._cleanup()
+                    await asyncio.sleep(1)  # Brief pause
+                    if not await self.api.mcp_client.connect():
+                        self.logger.warning(f"[{date}] Failed to refresh connection")
+                except Exception as e:
+                    self.logger.warning(f"[{date}] Connection refresh error: {e}")
+
         year, month = date[:4], date[4:6]
         date_path = Path(output_dir) / year / month
         file_path = date_path / f"{date}.parquet"
-        
+
         # Check if file exists
         if file_path.exists():
             self.logger.info(f"[{date}] File exists, skipping")
