@@ -138,3 +138,49 @@ class ThetaDataAPI:
                 self.logger.warning("MCP client cleanup timed out")
             except Exception as e:
                 self.logger.debug(f"Error closing MCP client: {e}")
+
+    async def reset(self, force_reconnect: bool = False):
+        """
+        Reset/refresh connections between batches or days.
+        
+        Args:
+            force_reconnect: If True, close and recreate all connections
+        """
+        if force_reconnect:
+            self.logger.info("Force reconnecting to Theta Terminal...")
+            
+            # Close existing connections
+            await self.close()
+            
+            # Recreate HTTP session
+            limits = httpx.Limits(
+                max_connections=200,
+                max_keepalive_connections=100,
+                keepalive_expiry=30.0
+            )
+            
+            self.session = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=limits,
+                http2=True
+            )
+            
+            # Recreate MCP client
+            if self.use_mcp:
+                self.mcp_client = ThetaDataMCP(self.config, self.logger)
+            
+            self.logger.info("Reconnection complete")
+        else:
+            # Soft reset - just clear connection pool
+            if self.session:
+                # Force release of idle connections
+                await self.session.aclose()
+                self.session = httpx.AsyncClient(
+                    timeout=self.timeout,
+                    limits=httpx.Limits(
+                        max_connections=200,
+                        max_keepalive_connections=100,
+                        keepalive_expiry=30.0
+                    ),
+                    http2=True
+                )

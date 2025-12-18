@@ -1,29 +1,17 @@
 ﻿"""
 ThetaData MCP protocol connector for Theta Terminal v3.
+OPTIMIZED: Hardcoded tool name - NO tool discovery overhead.
+FIXED: Properly handles ExceptionGroup errors from Python 3.11+.
+FIXED: Detects and handles 500 Server Error with extended cooldown.
 """
 import logging
 import asyncio
 from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timedelta
 from config.settings import Config
-from utils.diagnostics import MCPResponseHandler, MCPToolExtractor, ErrorTracer
-import orjson  # Replace standard json with orjson
-
-# anyio may be used by httpx/httpcore/mcp stack for cancellation semantics
-try:
-    import anyio
-except Exception:
-    anyio = None
-
-# Optional runtime imports for explicit timeout exception mapping
-try:
-    import httpx
-except Exception:
-    httpx = None
-try:
-    import httpcore
-except Exception:
-    httpcore = None
+from utils.diagnostics import MCPResponseHandler, ErrorTracer
+import uuid
+import sys
 
 # MCP imports
 try:
@@ -39,7 +27,10 @@ except ImportError:
 
 
 class ThetaDataMCP:
-    """MCP client for ThetaData API.""" 
+    """MCP client for ThetaData API - OPTIMIZED with hardcoded tool name.""" 
+    
+    # ✅ HARDCODED TOOL NAME - No discovery needed!
+    _TOOL_NAME = "stock_history_ohlc"  # Standard ThetaData MCP tool name
     
     def __init__(self, config: Config, logger: logging.Logger):
         """Initialize MCP client with configuration.""" 
@@ -52,29 +43,77 @@ class ThetaDataMCP:
             self.mcp_url = f"ws://{host}:{port}/mcp/sse"
         
         self._session = None
-        self._tool_name = None
         self._lock = asyncio.Lock()
         self._request_timeout = getattr(config, 'REQUEST_TIMEOUT', 30)
         self._sse_context = None
         self._session_context = None
         
-        # ✅ Error rate limiting
+        # ✅ Enhanced error rate limiting with server crash detection
         self._error_count = 0
-        self._error_threshold = 20
-        self._cooldown_duration = 60  # 1 minute in seconds
+        self._error_threshold = 15  # Lower threshold for server errors
+        self._cooldown_duration = 120  # 2 minutes base cooldown
         self._last_error_reset = datetime.now()
-        self._error_lock = asyncio.Lock()  # Protect error counter in concurrent environment
+        self._error_lock = asyncio.Lock()
         
-        # Initialize diagnostic helpers - DISABLE debug file saving
+        # ✅ Track server errors specifically
+        self._server_error_count = 0  # Track 500 errors
+        self._last_500_time = None
+        
+        # Initialize diagnostic helper - DISABLE debug file saving
         self.response_handler = MCPResponseHandler(logger, save_debug_files=False)
-        self.tool_extractor = MCPToolExtractor(logger)
         
         self.logger.info(f"Initializing MCP client with URL: {self.mcp_url}")
+        self.logger.info(f"Using hardcoded tool: {self._TOOL_NAME}")
+
+        # ✅ Cache logger level check
+        self._debug_enabled = logger.isEnabledFor(logging.DEBUG)
+
+    def _extract_real_exception(self, e: Exception) -> Exception:
+        """
+        Extract the actual exception from an ExceptionGroup (Python 3.11+).
+        
+        ExceptionGroups wrap multiple exceptions. We extract the first one
+        to get the real error message.
+        
+        Args:
+            e: Exception (might be ExceptionGroup or regular exception)
+            
+        Returns:
+            The first nested exception, or the original exception
+        """
+        # Check if it's an ExceptionGroup
+        exception_type_name = type(e).__name__
+        
+        if exception_type_name in ('ExceptionGroup', 'BaseExceptionGroup'):
+            # ExceptionGroup has 'exceptions' attribute
+            if hasattr(e, 'exceptions') and e.exceptions:
+                # Recursively extract from first exception
+                first_exception = e.exceptions[0]
+                return self._extract_real_exception(first_exception)
+        
+        # Return the exception as-is if not an ExceptionGroup
+        return e
 
     async def check_connection(self) -> bool:
         """Check if connection to MCP server can be established.""" 
         try:
-            return await self.connect()
+            if not HAS_MCP:
+                self.logger.error("MCP package not installed")
+                return False
+            
+            # Quick port check
+            try:
+                _, writer = await asyncio.open_connection(
+                    self.config.get('MCP_HOST', 'localhost'),
+                    self.config.get('MCP_PORT', 25503)
+                )
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except Exception as e:
+                self.logger.error(f"Port check failed: {e}")
+                return False
+                
         except asyncio.TimeoutError:
             self.logger.error("Connection check timed out")
             return False
@@ -83,99 +122,15 @@ class ThetaDataMCP:
             return False
 
     async def connect(self) -> bool:
-        """Establish connection to MCP server.""" 
-        if not HAS_MCP:
-            self.logger.error("MCP package not installed")
-            return False
-            
-        async with self._lock:
-            if self._session and not self._session.closed:
-                return True
-            
-            try:
-                self.logger.debug(f"Attempting connection to {self.mcp_url}")
-                
-                # Check if port is accessible
-                try:
-                    _, writer = await asyncio.open_connection(
-                        self.config.get('MCP_HOST', 'localhost'),
-                        self.config.get('MCP_PORT', 25503)
-                    )
-                    writer.close()
-                    await writer.wait_closed()
-                except Exception as e:
-                    self.logger.error(f"ThetaTerminal not available at {self.mcp_url}: {str(e)}")
-                    return False
-                
-                async with asyncio.timeout(self._request_timeout):
-                    # Create SSE client connection
-                    self._sse_context = sse_client(self.mcp_url)
-                    reader, writer = await self._sse_context.__aenter__()
-                    self.logger.debug("SSE client connection established")
-                    
-                    # Create and initialize client session
-                    self._session_context = ClientSession(reader, writer)
-                    self._session = await self._session_context.__aenter__()
-                    
-                    # Initialize session and get tools
-                    await self._session.initialize()
-                    self.logger.debug("Session initialized")
-                    
-                    tools_response = await self._session.list_tools()
-                    
-                    # TEMPORARY: Log tool schema for stock_history_ohlc
-                    if hasattr(tools_response, 'tools'):
-                        for tool in tools_response.tools:
-                            if hasattr(tool, 'name') and 'stock_history_ohlc' in tool.name:
-                                self.logger.info(f"=== TOOL SCHEMA FOR {tool.name} ===")
-                                if hasattr(tool, 'inputSchema'):
-                                    self.logger.info(f"Input Schema: {tool.inputSchema}")
-                                self.logger.info(f"=== END TOOL SCHEMA ===")
-                    
-                    # Process tools using diagnostic helper
-                    available_tools = await self._extract_available_tools(tools_response)
-                    if not available_tools:
-                        self.logger.error("No tools found in MCP response")
-                        await self._cleanup()
-                        return False
-                    
-                    self._tool_name = await self._find_required_tool(available_tools)
-                    if not self._tool_name:
-                        await self._cleanup()
-                        return False
-                        
-                    self.logger.info("✓ MCP connection established successfully")
-                    return True
-                    
-            except asyncio.TimeoutError:
-                self.logger.error(f"Connection attempt timed out after {self._request_timeout}s")
-                await self._cleanup()
-                return False
-            except Exception as e:
-                root_cause = ErrorTracer.get_root_cause(e)
-                self.logger.error(f"Connection failed: {type(root_cause).__name__}: {str(root_cause)}")
-                await self._cleanup()
-                return False
-
-    async def _extract_available_tools(self, tools_response: Any) -> List[str]:
-        """Extract available tools from response.""" 
-        return self.tool_extractor.extract_tools(tools_response)
-        
-    async def _find_required_tool(self, available_tools: List[str]) -> Optional[str]:
-        """Find required tool from available tools.""" 
-        required_tools = [
-            "stock_history_ohlc",
-            "stock.history.ohlc",
-            "stock/history/ohlc",
-            "stock_history_minute",
-            "stock.history.minute"
-        ]
-        return self.tool_extractor.find_required_tool(available_tools, required_tools)
+        """Legacy compatibility method - checks connection availability."""
+        return await self.check_connection()
 
     async def _cleanup(self):
         """Clean up all resources properly.""" 
+        self.logger.debug("cleanup: start")
         try:
             if self._session_context:
+                self.logger.debug("cleanup: closing session context")
                 try:
                     await self._session_context.__aexit__(None, None, None)
                 except Exception as e:
@@ -185,6 +140,7 @@ class ThetaDataMCP:
                     self._session = None
             
             if self._sse_context:
+                self.logger.debug("cleanup: closing SSE context")
                 try:
                     await self._sse_context.__aexit__(None, None, None)
                 except Exception as e:
@@ -194,16 +150,33 @@ class ThetaDataMCP:
                     
         except Exception as e:
             self.logger.debug(f"Cleanup error: {e}")
+        self.logger.debug("cleanup: end")
 
-    async def _increment_error_count(self) -> bool:
+    async def _increment_error_count(self, is_server_error: bool = False) -> bool:
         """
         Increment error count and check if cooldown is needed.
+        
+        Args:
+            is_server_error: True if this is a 500/502 server error
         
         Returns:
             True if cooldown should be triggered, False otherwise
         """ 
         async with self._error_lock:
             self._error_count += 1
+            
+            # Track server errors separately
+            if is_server_error:
+                self._server_error_count += 1
+                self._last_500_time = datetime.now()
+                
+                # ✅ AGGRESSIVE: Trigger cooldown after just 2 consecutive 500 errors
+                if self._server_error_count >= 2:
+                    self.logger.error(
+                        f"🚨 CRITICAL: Server crashing! {self._server_error_count} consecutive 500 errors. "
+                        f"Triggering EXTENDED cooldown to let server recover..."
+                    )
+                    return True
             
             if self._error_count >= self._error_threshold:
                 self.logger.warning(
@@ -212,7 +185,7 @@ class ThetaDataMCP:
                 )
                 return True
             
-            self.logger.debug(f"Error count: {self._error_count}/{self._error_threshold}")
+            self.logger.debug(f"Error count: {self._error_count}/{self._error_threshold}, 500s: {self._server_error_count}")
             return False
 
     async def _reset_error_count(self):
@@ -221,229 +194,145 @@ class ThetaDataMCP:
             if self._error_count > 0:
                 self.logger.debug(f"Resetting error count from {self._error_count} to 0")
                 self._error_count = 0
+                self._server_error_count = 0  # Also reset server error counter
                 self._last_error_reset = datetime.now()
 
     async def _apply_cooldown(self):
         """Apply cooldown period and reset error counter.""" 
         async with self._error_lock:
+            # ✅ EXTENDED cooldown for server crashes
+            cooldown_time = self._cooldown_duration
+            if self._server_error_count >= 2:
+                cooldown_time = 600  # 10 MINUTES for severe server crashes!
+                self.logger.error(
+                    f"💥 SERVER CRASH DETECTED! "
+                    f"Entering EXTENDED cooldown ({cooldown_time}s = {cooldown_time//60} minutes) "
+                    f"to allow Theta Terminal to recover..."
+                )
+            
             self.logger.warning(
-                f"🕐 Entering cooldown period ({self._cooldown_duration}s) "
-                f"after {self._error_count} consecutive errors"
+                f"🕐 Entering cooldown period ({cooldown_time}s) "
+                f"after {self._error_count} errors ({self._server_error_count} server crashes)"
             )
             error_count_before = self._error_count
+            server_errors_before = self._server_error_count
             self._error_count = 0
+            self._server_error_count = 0
             self._last_error_reset = datetime.now()
         
         try:
-            # Sleep outside the lock to allow other operations
-            await asyncio.sleep(self._cooldown_duration)
+            await asyncio.sleep(cooldown_time)
             self.logger.info(
                 f"✓ Cooldown period completed. Resuming operations "
-                f"(had {error_count_before} errors)"
+                f"(had {error_count_before} errors, {server_errors_before} server crashes)"
             )
         except asyncio.CancelledError:
             self.logger.debug("Cooldown cancelled")
-            raise
-
-    def _is_cancellation(self, exc: BaseException) -> bool:
-        """
-        Detect cancellation exceptions coming from asyncio/anyio/httpx/httpcore layers.
-
-        Returns True if exc should be treated as a cancellation (and re-raised).
-        Behaviour:
-         - If the current asyncio Task has been explicitly cancelled, treat as cancellation.
-         - Do NOT treat internal anyio/httpx "cancel scope" cancellations or WouldBlock as
-           coordinator cancellations unless the current Task is cancelled.
-        """
-        # If this is a native asyncio CancelledError, only propagate when the current task is cancelled.
-        if isinstance(exc, asyncio.CancelledError):
-            try:
-                task = asyncio.current_task()
-                if task is not None and task.cancelled():
-                    return True
-            except Exception:
-                # defensive: if we can't determine task state, fall back to propagating
-                return True
-            return False
-
-        # anyio exposes the concrete cancellation exception class via get_cancelled_exc()
-        if anyio is not None:
-            try:
-                cancel_exc = anyio.get_cancelled_exc()
-                if cancel_exc is not None and isinstance(exc, cancel_exc):
-                    try:
-                        task = asyncio.current_task()
-                        if task is not None and task.cancelled():
-                            return True
-                    except Exception:
-                        return True
-                    return False
-            except Exception:
-                # defensive: if anyio API differs, fall back to message checks below
-                pass
-
-        # Heuristic: only treat explicit cancel scopes/cancellation messages as cancellation
-        # when the current task was cancelled. This avoids treating internal HTTP/IO read
-        # timeouts (which sometimes raise "cancel scope" messages) as coordinator cancellations.
-        try:
-            text = str(exc)
-            if "cancel scope" in text.lower() or "cancelled via cancel scope" in text.lower():
-                try:
-                    task = asyncio.current_task()
-                    if task is not None and task.cancelled():
-                        return True
-                except Exception:
-                    return True
-                return False
-        except Exception:
-            pass
-
-        return False
+            return
 
     async def fetch_market_data(self, symbol: str, date: str, start_time: str = None, end_time: str = None, max_retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetch market data using MCP protocol with retry logic and error rate limiting.""" 
+        """
+        Fetch market data using fresh SSE session per request.
+        NO TOOL DISCOVERY - uses hardcoded tool name.
+        HANDLES ExceptionGroup properly.
+        DETECTS 500 Server Errors and triggers extended cooldown.
+        """
+        req_id = self._make_req_id(symbol, date)
         
         for attempt in range(max_retries):
+            session_ctx = None
+            sse_ctx = None
+            
             try:
-                # Check if session is valid, reconnect if needed
-                if not self._session or (hasattr(self._session, 'closed') and self._session.closed):
-                    self.logger.warning(f"[{symbol}] Session closed, attempting reconnect (attempt {attempt + 1}/{max_retries})")
-                    
-                    try:
-                        if not await self.connect():
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                                continue
-                            else:
-                                self.logger.error(f"[{symbol}] Failed to reconnect after {max_retries} attempts")
-                                # Count connection failure as error
-                                if await self._increment_error_count():
-                                    await self._apply_cooldown()
-                                return None
-                    except asyncio.CancelledError:
-                        # Cancelled during reconnection
-                        self.logger.debug(f"[{symbol}] Cancelled during reconnection")
-                        raise
-    
                 args = self._build_request_args(symbol, date, start_time, end_time)
                 if not args:
                     return None
                 
-                self.logger.debug(f"[{symbol}] Requesting data (attempt {attempt + 1}/{max_retries}) with args: {args}")
+                if self._debug_enabled:
+                    self.logger.debug(f"[{req_id}] Creating fresh SSE session (attempt {attempt + 1})")
                 
-                # Add timeout to tool call - handle anyio/httpx cancellations explicitly
-                try:
-                    async with asyncio.timeout(self._request_timeout):
-                        response = await self._session.call_tool(self._tool_name, arguments=args)
-                except asyncio.CancelledError as ce:
-                    # Distinguish between:
-                    #  - explicit task cancellation triggered by coordinator/user (propagate)
-                    #  - internal anyio/httpx "cancel scope" used for timeouts (map to transient read timeout)
-                    text = str(ce).lower() if ce is not None else ""
-                    try:
-                        task = asyncio.current_task()
-                        explicitly_cancelled = task is not None and task.cancelled()
-                    except Exception:
-                        explicitly_cancelled = False
-
-                    if explicitly_cancelled:
-                        self.logger.debug(f"[{symbol}] Request cancelled during API call (explicit task cancel)")
-                        raise  # propagate real coordinator/user cancellation
-
-                    # Heuristic: internal cancel scopes include "cancel scope" / "cancelled via cancel scope"
-                    if "cancel scope" in text or "cancelled via cancel scope" in text:
-                        # Map internal cancel-scope to transient read timeout so outer logic retries
-                        self.logger.debug(f"[{symbol}] Internal cancel-scope CancelledError mapped to transient read timeout")
-                        raise RuntimeError("ReadTimeout (mapped from cancel-scope CancelledError)") from ce
-
-                    # Otherwise be conservative and propagate
-                    self.logger.debug(f"[{symbol}] Request cancelled during API call (asyncio.CancelledError) - propagating")
-                    raise
-
-                self.logger.debug(f"[{symbol}] Raw response type: {type(response)}")
-                
-                result = await self._handle_rpc_response(response, symbol)
-                
-                # If successful, return result
-                if result is not None:
-                    # ✅ Reset error count on success
-                    await self._reset_error_count()
-                    return result
-                
-                # If no data but no error, return None (don't retry)
-                return None
-                
+                async with asyncio.timeout(self._request_timeout):
+                    # Create new SSE connection
+                    sse_ctx = sse_client(self.mcp_url)
+                    reader, writer = await sse_ctx.__aenter__()
+                    
+                    # Create new session
+                    session_ctx = ClientSession(reader, writer)
+                    session = await session_ctx.__aenter__()
+                    
+                    # Initialize and call tool (using hardcoded name)
+                    await session.initialize()
+                    response = await session.call_tool(self._TOOL_NAME, arguments=args)
+                    
+                    # Process response
+                    result = await self._handle_rpc_response(response, symbol)
+                    if result is not None:
+                        await self._reset_error_count()
+                        return result
+                    return None
+                    
             except asyncio.CancelledError:
-                # ✅ CRITICAL: Propagate cancellation immediately - DO NOT RETRY
-                self.logger.debug(f"[{symbol}] Request cancelled by coordinator")
-                raise  # Re-raise to propagate cancellation
+                self.logger.debug(f"[{req_id}] Cancelled by coordinator")
+                raise
                 
-            except asyncio.TimeoutError:
-                # ✅ Handle timeout separately from cancellation
-                self.logger.warning(f"[{symbol}] Request timeout (attempt {attempt + 1}/{max_retries})")
+            except BaseException as e:  # ✅ Catch BaseException to handle ExceptionGroup
+                # ✅ Extract the real exception from ExceptionGroup
+                real_exception = self._extract_real_exception(e)
+                error_type = type(real_exception).__name__
+                error_msg = str(real_exception)[:400]  # Increased to 400 chars for full error
                 
-                # Count timeout as error
-                if await self._increment_error_count():
+                # ✅ Detect server errors (500/502)
+                is_server_error = (
+                    "500" in error_msg or 
+                    "502" in error_msg or 
+                    "Server Error" in error_msg or
+                    "Bad Gateway" in error_msg or
+                    "HTTPStatusError" in error_type
+                )
+                
+                # ✅ Check if it's a cancellation
+                is_cancelled = isinstance(real_exception, asyncio.CancelledError)
+                
+                # Re-raise CancelledError immediately
+                if is_cancelled:
+                    raise
+                
+                # ✅ Log server errors at ERROR level always
+                if is_server_error:
+                    self.logger.error(
+                        f"[{req_id}] 🚨 SERVER ERROR on attempt {attempt + 1}/{max_retries}: "
+                        f"{error_type} - {error_msg}"
+                    )
+                elif attempt == 0 or attempt == max_retries - 1:
+                    self.logger.warning(f"[{req_id}] {error_type} on attempt {attempt + 1}/{max_retries}: {error_msg}")
+                else:
+                    self.logger.debug(f"[{req_id}] {error_type} on attempt {attempt + 1}/{max_retries}")
+                
+                if await self._increment_error_count(is_server_error=is_server_error):
                     await self._apply_cooldown()
                 
                 if attempt < max_retries - 1:
-                    try:
-                        await asyncio.sleep(2 ** attempt)
-                    except asyncio.CancelledError:
-                        # If cancelled during sleep, propagate immediately
-                        self.logger.debug(f"[{symbol}] Cancelled during retry backoff")
-                        raise
+                    # ✅ LONGER backoff for server errors
+                    backoff = (2 ** attempt) * (5 if is_server_error else 1)
+                    self.logger.debug(f"[{req_id}] Retrying after {backoff}s backoff")
+                    await asyncio.sleep(backoff)
                     continue
                 else:
-                    self.logger.error(f"[{symbol}] Failed after {max_retries} timeout attempts")
+                    self.logger.error(f"[{req_id}] Failed after {max_retries} attempts: {error_type}")
                     return None
-        
-            except Exception as e:
-                # If this exception is actually an anyio/httpx cancellation, propagate immediately.
-                if self._is_cancellation(e):
-                    self.logger.debug(f"[{symbol}] Detected cancellation in exception handler ({type(e).__name__}), propagating")
-                    raise
-
-                error_type = type(e).__name__
-                
-                # Check if it's a connection error that should trigger retry
-                connection_errors = ['ClosedResourceError', 'McpError', 'ConnectionError', 'BrokenPipeError', 'ReadTimeout']
-                is_connection_error = any(err in error_type or err in str(e) for err in connection_errors)
-                
-                if is_connection_error:
-                    self.logger.warning(f"[{symbol}] Connection error: {error_type} (attempt {attempt + 1}/{max_retries})")
                     
-                    # Count connection error
-                    if await self._increment_error_count():
-                        await self._apply_cooldown()
-                    
-                    # Force cleanup and reconnect
-                    await self._cleanup()
-                    
-                    if attempt < max_retries - 1:
-                        backoff = 2 ** attempt
-                        self.logger.info(f"[{symbol}] Waiting {backoff}s before retry...")
-                        try:
-                            await asyncio.sleep(backoff)
-                        except asyncio.CancelledError:
-                            # If cancelled during sleep, propagate immediately
-                            self.logger.debug(f"[{symbol}] Cancelled during retry backoff")
-                            raise
-                        continue
-                    else:
-                        self.logger.error(f"[{symbol}] Failed after {max_retries} attempts: {e}")
-                        ErrorTracer.log_exception(self.logger, e, f"MCP data fetch error for {symbol}")
-                        return None
-                else:
-                    # Non-connection error, don't retry but still count
-                    self.logger.error(f"[{symbol}] Non-retryable error: {error_type}")
-                    ErrorTracer.log_exception(self.logger, e, f"MCP data fetch error for {symbol}")
-                    
-                    # Count non-retryable errors too
-                    if await self._increment_error_count():
-                        await self._apply_cooldown()
-                    
-                    return None
+            finally:
+                # CRITICAL: Always cleanup session immediately
+                if session_ctx:
+                    try:
+                        await session_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                if sse_ctx:
+                    try:
+                        await sse_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
 
     def _build_request_args(self, symbol: str, date: str, start_time: str = None, end_time: str = None) -> Optional[Dict[str, str]]:
         """Build and validate request arguments.""" 
@@ -457,15 +346,12 @@ class ThetaDataMCP:
             # ✅ Add format parameter if configured
             if hasattr(self.config, 'RESPONSE_FORMAT') and self.config.RESPONSE_FORMAT:
                 args["format"] = self.config.RESPONSE_FORMAT
-                self.logger.debug(f"[{symbol}] Using response format: {self.config.RESPONSE_FORMAT}")
             
             if start_time:
                 args["start_time"] = str(start_time).strip()
-                self.logger.debug(f"[{symbol}] Adding start_time: {start_time}")
             
             if end_time:
                 args["end_time"] = str(end_time).strip()
-                self.logger.debug(f"[{symbol}] Adding end_time: {end_time}")
             
             if hasattr(self.config, 'VENUE') and self.config.VENUE:
                 args["venue"] = str(self.config.VENUE).strip()
@@ -479,61 +365,44 @@ class ThetaDataMCP:
     async def _handle_rpc_response(self, response: Dict[str, Any], symbol: str) -> Optional[Union[Dict[str, Any], str]]:
         """Handle and validate JSON-RPC response (supports both JSON and CSV).""" 
         try:
-            # Log detailed response for debugging specific symbols
-            if symbol in ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']:
-                self.response_handler.log_detailed_response(response, symbol)
-        
             # Check for errors first
             error_message = self.response_handler.check_error_response(response, symbol)
             if error_message:
-                self.logger.error(f"MCP tool error for {symbol}: {error_message}")
+                # ✅ Log server errors at ERROR level
+                if "500" in error_message or "502" in error_message:
+                    self.logger.error(f"MCP tool error for {symbol}: {error_message}")
+                else:
+                    self.logger.warning(f"MCP tool error for {symbol}: {error_message}")
                 return None
         
             # Extract text content
             text_content = self.response_handler.extract_text_content(response)
-            self.logger.debug(f"[{symbol}] Text content extracted: {text_content is not None}")
         
             if text_content is not None:
-                self.logger.debug(f"[{symbol}] Text length: {len(text_content)}, starts with: {text_content[:50] if text_content else 'N/A'}")
-            
-                # ✅ NEW: Detect if response is CSV format
+                # ✅ Detect if response is CSV format
                 is_csv = self._detect_csv_format(text_content)
             
                 if is_csv:
-                    self.logger.info(f"[{symbol}] ✓ Detected CSV format, returning raw text for parser")
-                    # Return raw CSV string so parse_market_data can handle it
+                    self.logger.info(f"[{symbol}] ✓ Successfully received CSV ({len(text_content)} chars)")
                     return text_content
                 else:
                     # Parse as JSON
                     result = self.response_handler.parse_json_response(text_content, symbol)
                 
-                    self.logger.debug(f"[{symbol}] Parse result type: {type(result)}, is None: {result is None}")
-                
                     if result is not None:
                         if isinstance(result, list):
                             self.logger.info(f"[{symbol}] ✓ Successfully parsed {len(result)} records")
                         elif isinstance(result, dict):
-                            self.logger.info(f"[{symbol}] ✓ Successfully parsed dict with keys: {list(result.keys())}")
+                            self.logger.info(f"[{symbol}] ✓ Successfully parsed dict")
                         return result
-                    else:
-                        self.logger.warning(f"[{symbol}] parse_json_response returned None")
-                        return None
-            else:
-                self.logger.warning(f"[{symbol}] No text content extracted")
+                    return None
         
             # Fallback to dict-based response
-            if isinstance(response, dict):
-                if 'result' in response:
-                    result = response['result']
-                    if result and result != {} and result != []:
-                        self.logger.info(f"[{symbol}] Using fallback dict result")
-                        return result
-                    self.logger.debug(f"[{symbol}] Empty result in fallback")
-                else:
-                    self.logger.debug(f"[{symbol}] No 'result' key in fallback")
-                return None
-        
-            self.logger.warning(f"[{symbol}] Unexpected response format: {type(response)}")
+            if isinstance(response, dict) and 'result' in response:
+                result = response['result']
+                if result and result != {} and result != []:
+                    return result
+            
             return None
         
         except Exception as e:
@@ -541,24 +410,12 @@ class ThetaDataMCP:
             return None
 
     def _detect_csv_format(self, text: str) -> bool:
-        """
-        Detect if text content is CSV format.
-        
-        Args:
-            text: Text content to check
-            
-        Returns:
-            True if CSV format, False otherwise
-        """
+        """Detect if text content is CSV format."""
         if not text or len(text.strip()) == 0:
             return False
         
-        # Check first line for CSV indicators
         first_line = text.split('\n')[0].strip()
         
-        # CSV typically has:
-        # 1. Column headers with commas
-        # 2. Common OHLC column names
         csv_indicators = [
             'timestamp' in first_line.lower(),
             'open' in first_line.lower(),
@@ -566,12 +423,11 @@ class ThetaDataMCP:
             'low' in first_line.lower(),
             'close' in first_line.lower(),
             'volume' in first_line.lower(),
-            ',' in first_line,  # Has commas
-            not first_line.startswith('['),  # Doesn't start with JSON array
-            not first_line.startswith('{')   # Doesn't start with JSON object
+            ',' in first_line,
+            not first_line.startswith('['),
+            not first_line.startswith('{')
         ]
         
-        # If at least 5 indicators are true, it's likely CSV
         return sum(csv_indicators) >= 5
 
     async def close(self):
@@ -582,3 +438,20 @@ class ThetaDataMCP:
             self.logger.warning("MCP cleanup timed out")
         except Exception as e:
             self.logger.debug(f"Error during MCP cleanup: {e}")
+    
+    async def reset(self, force_reconnect: bool = False) -> bool:
+        """Perform a full client reset - resets error counters."""
+        self.logger.info("Performing MCP client reset (daily cleanup)")
+        try:
+            async with self._error_lock:
+                self._error_count = 0
+                self._server_error_count = 0
+                self._last_error_reset = datetime.now()
+            return True
+        except Exception as e:
+            self.logger.error(f"MCP reset failed: {e}")
+            return False
+
+    def _make_req_id(self, symbol: str, date: str) -> str:
+        """Generate unique request ID for logging."""
+        return f"{symbol}-{date}-{uuid.uuid4().hex[:8]}"

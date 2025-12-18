@@ -235,10 +235,11 @@ class MCPResponseHandler:
                         return result
                     
                 except json.JSONDecodeError as parse_error:
-                    self.logger.warning(f"[{symbol}] Fixed JSON still has errors: {parse_error}")
+                    self.logger.debug(f"[{symbol}] Fixed JSON still has errors: {parse_error}")
                     # Fall through to regex extraction
             else:
-                self.logger.warning(f"[{symbol}] No changes made to text")
+                # REMOVED: Warning message that was showing up in logs
+                self.logger.debug(f"[{symbol}] No fixes applied, attempting regex extraction")
             
             # Last resort: Extract valid objects using regex
             self.logger.debug(f"[{symbol}] Attempting regex extraction as final fallback...")
